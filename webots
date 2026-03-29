@@ -1,22 +1,18 @@
 from controller import Robot
 from collections import Counter
+import random
 
 # ================= CONSTANTS =================
 TIME_STEP = 32
 MAX_SPEED = 6.28
 
-# Target Animal (Dog) RGB & Tolerance
-DOG_R, DOG_G, DOG_B = 77, 80, 89
+# Target Animal (Horse) RGB & Tolerance
+HORSE_R, HORSE_G, HORSE_B = 77, 80, 89
 TOLERANCE = 40
-
-# Image Capture Settings
-MAX_CAPTURES = 5 # Limits total photos so it doesn't spam your folder
-images_captured = 0
 
 # ================= INITIALIZATION =================
 robot = Robot()
 
-# Motors
 leftMotor = robot.getDevice('left wheel motor')
 rightMotor = robot.getDevice('right wheel motor')
 leftMotor.setPosition(float('inf'))
@@ -24,26 +20,28 @@ rightMotor.setPosition(float('inf'))
 leftMotor.setVelocity(0)
 rightMotor.setVelocity(0)
 
-# Distance Sensors
 ps = []
 for i in range(8):
     sensor = robot.getDevice(f'ps{i}')
     sensor.enable(TIME_STEP)
     ps.append(sensor)
 
-# Braitenberg Weights (Right steers right, Left steers left)
 LEFT_WEIGHTS  = [ 0.9,  0.5,  0.2, -0.1, -0.1,  0.2,  0.5,  0.9]
 RIGHT_WEIGHTS = [-0.9, -0.5, -0.2,  0.1,  0.1, -0.2, -0.5, -0.9]
 
 OBSTACLE_THRESHOLD = 80.0    
-STUCK_THRESHOLD    = 200.0  
+STUCK_THRESHOLD    = 500.0  # Lowered to detect walls earlier
 SENSOR_MAX         = 4096.0  
 
-# Camera
 cam = robot.getDevice('camera')
 cam.enable(TIME_STEP)
 W = cam.getWidth()
 H = cam.getHeight()
+
+# --- EXPLORATION VARIABLES ---
+recovery_steps = 0  
+spin_dir = 1
+wander_offset = 0.0
 
 # ================= HELPER FUNCTIONS =================
 def set_velocity(left, right):
@@ -51,24 +49,35 @@ def set_velocity(left, right):
     rightMotor.setVelocity(max(-MAX_SPEED, min(MAX_SPEED, right)))
 
 def move_forward():
-    set_velocity(0.5 * MAX_SPEED, 0.5 * MAX_SPEED)
-
-def back_up():
-    set_velocity(-0.3 * MAX_SPEED, -0.15 * MAX_SPEED)
+    global wander_offset
+    # 5% chance every frame to slightly shift its drift
+    # This prevents straight-line wall-following and forces center exploration
+    if random.random() < 0.05:
+        wander_offset = random.uniform(-0.15, 0.15)
+        
+    left = (0.5 + wander_offset) * MAX_SPEED
+    right = (0.5 - wander_offset) * MAX_SPEED
+    set_velocity(left, right)
 
 def handle_obstacles(readings):
-    front_sensors = [readings[0], readings[1], readings[6], readings[7]]
+    global recovery_steps, spin_dir
     
-    # Stuck recovery
-    if all(v > STUCK_THRESHOLD for v in front_sensors):
-        back_up()
+    # 1. If recovering, execute the random spin
+    if recovery_steps > 0:
+        set_velocity(spin_dir * 0.5 * MAX_SPEED, -spin_dir * 0.5 * MAX_SPEED)
+        recovery_steps -= 1
         return True
 
-    # Check if path is clear
+    # 2. Wall Trap Detection (Front or slight-front sensors)
+    if readings[0] > STUCK_THRESHOLD or readings[7] > STUCK_THRESHOLD or readings[1] > STUCK_THRESHOLD or readings[6] > STUCK_THRESHOLD:
+        recovery_steps = random.randint(15, 35) # Spin for a random duration
+        spin_dir = random.choice([-1, 1])       # Pick a random direction (left or right)
+        return True
+
+    # 3. Standard Braitenberg avoidance for distant obstacles
     if not any(v > OBSTACLE_THRESHOLD for v in readings):
         return False
 
-    # Braitenberg steering logic
     norm = [v / SENSOR_MAX for v in readings]
     left_speed  = 0.5 * MAX_SPEED
     right_speed = 0.5 * MAX_SPEED
@@ -90,16 +99,15 @@ def sample_region(img, cx, cy, size=5):
                 gs.append(cam.imageGetGreen(img, W, x, y))
                 bs.append(cam.imageGetBlue(img, W, x, y))
     
-    # Safety check to prevent division by zero
     if not rs: return 0, 0, 0 
     return sum(rs) // len(rs), sum(gs) // len(gs), sum(bs) // len(bs)
 
 def detect_target(r, g, b):
-    # 1. Check for the Dog first
-    if (abs(r - DOG_R) < TOLERANCE and abs(g - DOG_G) < TOLERANCE and abs(b - DOG_B) < TOLERANCE):
-        return "dog"
+    # 1. Horse Check
+    if (abs(r - HORSE_R) < TOLERANCE and abs(g - HORSE_G) < TOLERANCE and abs(b - HORSE_B) < TOLERANCE):
+        return "horse"
     
-    # 2. If not the dog, check for primary color blocks
+    # 2. Block Check
     threshold = 50
     diff = 30
     if r > g + diff and r > b + diff and r > threshold:
@@ -112,43 +120,36 @@ def detect_target(r, g, b):
     return "NONE"
 
 # ================= MAIN LOOP =================
-encounter_log = []
-last_detected = None
+seen_targets = set()  
+encounter_order = []  
 
-print("Starting Webots Controller...")
-print("Ready to detect: Red, Green, Blue blocks, and the Dog.")
+print("Starting Webots Controller (Random Walk Enabled)...")
+print("Mission: Find the Red, Green, and Blue blocks, and the Horse (1 time each).")
 
 while robot.step(TIME_STEP) != -1:
     readings = [s.getValue() for s in ps]
     avoiding = handle_obstacles(readings)
 
-    # Only process the camera if we aren't busy avoiding a wall
     if not avoiding:
         img = cam.getImage()
         r, g, b = sample_region(img, W // 2, H // 2)
         detected = detect_target(r, g, b)
 
-        # If we see something new (and it's not NONE)
-        if detected != last_detected:
-            if detected != "NONE":
-                encounter_log.append(detected)
-                print(f"\n---> I see a {detected.upper()} object!")
-                
-                # --- CONDITIONAL TRIGGERING: IMAGE CAPTURE ---
-                if images_captured < MAX_CAPTURES:
-                    filename = f"captured_{detected}_{images_captured + 1}.png"
-                    cam.saveImage(filename, 100)
-                    print(f"[*] PHOTO CAPTURED AND SAVED AS: {filename} [*]")
-                    images_captured += 1
-                
-                # Print Encounter Summary
-                counts = Counter(encounter_log)
-                print("--- Summary so far ---")
-                for item, count in counts.items():
-                    print(f"  {item}: {count} time(s)")
-                print(f"  Order seen: {' -> '.join(encounter_log)}")
-                print("----------------------\n")
+        if detected != "NONE" and detected not in seen_targets:
+            seen_targets.add(detected)
+            encounter_order.append(detected)
+            print(f"\n---> SUCCESS: Found the {detected.upper()}!")
             
-            last_detected = detected
+            filename = f"captured_final_{detected}.png"
+            cam.saveImage(filename, 100)
+            print(f"[*] PHOTO CAPTURED AND SAVED AS: {filename} [*]")
+            
+            print("--- Mission Progress ---")
+            print(f"  Total Found: {len(seen_targets)} / 4")
+            print(f"  Order seen: {' -> '.join(encounter_order)}")
+            print("------------------------\n")
+            
+            if len(seen_targets) == 4:
+                print("MISSION COMPLETE: All 4 targets located.")
 
         move_forward()
